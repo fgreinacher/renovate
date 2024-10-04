@@ -4,24 +4,33 @@ import { regEx } from '../../../util/regex';
 import { ensureTrailingSlash } from '../../../util/url';
 import * as ivyVersioning from '../../versioning/ivy';
 import { compare } from '../../versioning/maven/compare';
+import { MAVEN_REPO } from '../maven/common';
 import { downloadHttpProtocol } from '../maven/util';
 import { SbtPackageDatasource } from '../sbt-package';
-import { getLatestVersion, parseIndexDir } from '../sbt-package/util';
-import type { GetReleasesConfig, ReleaseResult } from '../types';
+import { extractPageLinks, getLatestVersion } from '../sbt-package/util';
+import type {
+  GetReleasesConfig,
+  RegistryStrategy,
+  ReleaseResult,
+} from '../types';
 
 export const SBT_PLUGINS_REPO =
   'https://repo.scala-sbt.org/scalasbt/sbt-plugin-releases';
 
-export const defaultRegistryUrls = [SBT_PLUGINS_REPO];
+export const defaultRegistryUrls = [SBT_PLUGINS_REPO, MAVEN_REPO];
 
 export class SbtPluginDatasource extends SbtPackageDatasource {
   static override readonly id = 'sbt-plugin';
 
   override readonly defaultRegistryUrls = defaultRegistryUrls;
 
-  override readonly registryStrategy = 'hunt';
+  override readonly registryStrategy: RegistryStrategy = 'merge';
 
   override readonly defaultVersioning = ivyVersioning.id;
+
+  override readonly sourceUrlSupport = 'package';
+  override readonly sourceUrlNote =
+    'The source URL is determined from the `scm` tags in the results.';
 
   constructor() {
     super(SbtPluginDatasource.id);
@@ -34,15 +43,20 @@ export class SbtPluginDatasource extends SbtPackageDatasource {
     scalaVersion: string,
   ): Promise<string[] | null> {
     const searchRoot = `${rootUrl}/${artifact}`;
-    const parse = (content: string): string[] =>
-      parseIndexDir(content, (x) => !regEx(/^\.+$/).test(x));
-    const { body: indexContent } = await downloadHttpProtocol(
+    const hrefFilterMap = (href: string): string | null => {
+      if (href.startsWith('.')) {
+        return null;
+      }
+
+      return href;
+    };
+    const res = await downloadHttpProtocol(
       this.http,
       ensureTrailingSlash(searchRoot),
     );
-    if (indexContent) {
+    if (res) {
       const releases: string[] = [];
-      const scalaVersionItems = parse(indexContent);
+      const scalaVersionItems = extractPageLinks(res.body, hrefFilterMap);
       const scalaVersions = scalaVersionItems.map((x) =>
         x.replace(regEx(/^scala_/), ''),
       );
@@ -51,20 +65,28 @@ export class SbtPluginDatasource extends SbtPackageDatasource {
         : scalaVersions;
       for (const searchVersion of searchVersions) {
         const searchSubRoot = `${searchRoot}/scala_${searchVersion}`;
-        const { body: subRootContent } = await downloadHttpProtocol(
+        const subRootRes = await downloadHttpProtocol(
           this.http,
           ensureTrailingSlash(searchSubRoot),
         );
-        if (subRootContent) {
-          const sbtVersionItems = parse(subRootContent);
+        if (subRootRes) {
+          const { body: subRootContent } = subRootRes;
+          const sbtVersionItems = extractPageLinks(
+            subRootContent,
+            hrefFilterMap,
+          );
           for (const sbtItem of sbtVersionItems) {
             const releasesRoot = `${searchSubRoot}/${sbtItem}`;
-            const { body: releasesIndexContent } = await downloadHttpProtocol(
+            const releaseIndexRes = await downloadHttpProtocol(
               this.http,
               ensureTrailingSlash(releasesRoot),
             );
-            if (releasesIndexContent) {
-              const releasesParsed = parse(releasesIndexContent);
+            if (releaseIndexRes) {
+              const { body: releasesIndexContent } = releaseIndexRes;
+              const releasesParsed = extractPageLinks(
+                releasesIndexContent,
+                hrefFilterMap,
+              );
               releasesParsed.forEach((x) => releases.push(x));
             }
           }
@@ -94,7 +116,9 @@ export class SbtPluginDatasource extends SbtPackageDatasource {
     const repoRoot = ensureTrailingSlash(registryUrl);
     const searchRoots: string[] = [];
     // Optimize lookup order
-    searchRoots.push(`${repoRoot}${groupIdSplit.join('.')}`);
+    if (!registryUrl.startsWith(MAVEN_REPO)) {
+      searchRoots.push(`${repoRoot}${groupIdSplit.join('.')}`);
+    }
     searchRoots.push(`${repoRoot}${groupIdSplit.join('/')}`);
 
     for (let idx = 0; idx < searchRoots.length; idx += 1) {

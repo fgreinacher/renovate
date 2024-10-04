@@ -8,12 +8,12 @@ import { compare } from '../../versioning/maven/compare';
 import { MavenDatasource } from '../maven';
 import { MAVEN_REPO } from '../maven/common';
 import { downloadHttpProtocol } from '../maven/util';
-import type { GetReleasesConfig, ReleaseResult } from '../types';
-import {
-  getLatestVersion,
-  normalizeRootRelativeUrls,
-  parseIndexDir,
-} from './util';
+import type {
+  GetReleasesConfig,
+  RegistryStrategy,
+  ReleaseResult,
+} from '../types';
+import { extractPageLinks, getLatestVersion } from './util';
 
 export class SbtPackageDatasource extends MavenDatasource {
   static override id = 'sbt-package';
@@ -22,7 +22,11 @@ export class SbtPackageDatasource extends MavenDatasource {
 
   override readonly defaultVersioning = ivyVersioning.id;
 
-  override readonly registryStrategy = 'hunt';
+  override readonly registryStrategy: RegistryStrategy = 'hunt';
+
+  override readonly sourceUrlSupport = 'package';
+  override readonly sourceUrlNote =
+    'The source URL is determined from the `scm` tags in the results.';
 
   constructor(id = SbtPackageDatasource.id) {
     super(id);
@@ -35,26 +39,26 @@ export class SbtPackageDatasource extends MavenDatasource {
     scalaVersion: string,
   ): Promise<string[] | null> {
     const pkgUrl = ensureTrailingSlash(searchRoot);
-    const { body: indexContent } = await downloadHttpProtocol(
-      this.http,
-      pkgUrl,
-    );
+    const res = await downloadHttpProtocol(this.http, pkgUrl);
+    const indexContent = res?.body;
     if (indexContent) {
-      const parseSubdirs = (content: string): string[] =>
-        parseIndexDir(content, (x) => {
-          if (x === artifact) {
-            return true;
-          }
-          if (x.startsWith(`${artifact}_native`)) {
-            return false;
-          }
-          if (x.startsWith(`${artifact}_sjs`)) {
-            return false;
-          }
-          return x.startsWith(`${artifact}_`);
-        });
-      const normalizedContent = normalizeRootRelativeUrls(indexContent, pkgUrl);
-      let artifactSubdirs = parseSubdirs(normalizedContent);
+      const rootPath = new URL(pkgUrl).pathname;
+      let artifactSubdirs = extractPageLinks(indexContent, (href) => {
+        const path = href.replace(rootPath, '');
+        if (
+          path.startsWith(`${artifact}_native`) ||
+          path.startsWith(`${artifact}_sjs`)
+        ) {
+          return null;
+        }
+
+        if (path === artifact || path.startsWith(`${artifact}_`)) {
+          return path;
+        }
+
+        return null;
+      });
+
       if (
         scalaVersion &&
         artifactSubdirs.includes(`${artifact}_${scalaVersion}`)
@@ -73,14 +77,21 @@ export class SbtPackageDatasource extends MavenDatasource {
   ): Promise<string[] | null> {
     if (artifactSubdirs) {
       const releases: string[] = [];
-      const parseReleases = (content: string): string[] =>
-        parseIndexDir(content, (x) => !regEx(/^\.+$/).test(x));
       for (const searchSubdir of artifactSubdirs) {
         const pkgUrl = ensureTrailingSlash(`${searchRoot}/${searchSubdir}`);
-        const { body: content } = await downloadHttpProtocol(this.http, pkgUrl);
+        const res = await downloadHttpProtocol(this.http, pkgUrl);
+        const content = res?.body;
         if (content) {
-          const normalizedContent = normalizeRootRelativeUrls(content, pkgUrl);
-          const subdirReleases = parseReleases(normalizedContent);
+          const rootPath = new URL(pkgUrl).pathname;
+          const subdirReleases = extractPageLinks(content, (href) => {
+            const path = href.replace(rootPath, '');
+            if (path.startsWith('.')) {
+              return null;
+            }
+
+            return path;
+          });
+
           subdirReleases.forEach((x) => releases.push(x));
         }
       }
@@ -116,8 +127,8 @@ export class SbtPackageDatasource extends MavenDatasource {
 
       for (const pomFileName of pomFileNames) {
         const pomUrl = `${searchRoot}/${artifactDir}/${version}/${pomFileName}`;
-        const { body: content } = await downloadHttpProtocol(this.http, pomUrl);
-
+        const res = await downloadHttpProtocol(this.http, pomUrl);
+        const content = res?.body;
         if (content) {
           const pomXml = new XmlDocument(content);
 

@@ -3,6 +3,7 @@ import { getPkgReleases } from '..';
 import { Fixtures } from '../../../../test/fixtures';
 import * as httpMock from '../../../../test/http-mock';
 import { fs } from '../../../../test/util';
+import { logger } from '../../../logger';
 import { CustomDatasource } from './index';
 
 jest.mock('../../../util/fs');
@@ -119,6 +120,49 @@ describe('modules/datasource/custom/index', () => {
       expect(result).toEqual(expected);
     });
 
+    it('return releases with tags and other optional fields for api directly exposing in renovate format', async () => {
+      const expected = {
+        releases: [
+          {
+            version: 'v1.0.0',
+          },
+        ],
+        tags: {
+          latest: 'v1.0.0',
+        },
+        sourceUrl: 'https://example.com/foo.git',
+        sourceDirectory: '/',
+        changelogUrl: 'https://example.com/foo/blob/main/CHANGELOG.md',
+        homepage: 'https://example.com/foo',
+      };
+      const content = {
+        releases: [
+          {
+            version: 'v1.0.0',
+          },
+        ],
+        tags: {
+          latest: 'v1.0.0',
+        },
+        sourceUrl: 'https://example.com/foo.git',
+        sourceDirectory: '/',
+        changelogUrl: 'https://example.com/foo/blob/main/CHANGELOG.md',
+        homepage: 'https://example.com/foo',
+        unknown: {},
+      };
+      httpMock.scope('https://example.com').get('/v1').reply(200, content);
+      const result = await getPkgReleases({
+        datasource: `${CustomDatasource.id}.foo`,
+        packageName: 'myPackage',
+        customDatasources: {
+          foo: {
+            defaultRegistryUrlTemplate: 'https://example.com/v1',
+          },
+        },
+      });
+      expect(result).toEqual(expected);
+    });
+
     it('return releases for plain text API directly exposing in Renovate format', async () => {
       const expected = {
         releases: [
@@ -185,6 +229,31 @@ describe('modules/datasource/custom/index', () => {
       expect(result).toEqual(expected);
     });
 
+    it('returns null if transformation using jsonata rules fail', async () => {
+      httpMock
+        .scope('https://example.com')
+        .get('/v1')
+        .reply(200, '1.0.0 \n2.0.0 \n 3.0.0 ', {
+          'Content-Type': 'text/plain',
+        });
+      const result = await getPkgReleases({
+        datasource: `${CustomDatasource.id}.foo`,
+        packageName: 'myPackage',
+        customDatasources: {
+          foo: {
+            defaultRegistryUrlTemplate: 'https://example.com/v1',
+            transformTemplates: ['$[.name = "Alice" and'],
+            format: 'plain',
+          },
+        },
+      });
+      expect(result).toBeNull();
+      expect(logger.debug).toHaveBeenCalledWith(
+        { err: expect.any(Object), transformTemplate: '$[.name = "Alice" and' },
+        'Error while transforming response',
+      );
+    });
+
     it('return releases for plain text API when only returns a single version', async () => {
       const expected = {
         releases: [
@@ -207,30 +276,6 @@ describe('modules/datasource/custom/index', () => {
         },
       });
       expect(result).toEqual(expected);
-    });
-
-    it('return null for plain text API if the body is not what is expected', async () => {
-      const expected = {
-        releases: [
-          {
-            version: '1.0.0',
-          },
-        ],
-      };
-      httpMock.scope('https://example.com').get('/v1').reply(200, expected, {
-        'Content-Type': 'application/json',
-      });
-      const result = await getPkgReleases({
-        datasource: `${CustomDatasource.id}.foo`,
-        packageName: 'myPackage',
-        customDatasources: {
-          foo: {
-            defaultRegistryUrlTemplate: 'https://example.com/v1',
-            format: 'plain',
-          },
-        },
-      });
-      expect(result).toBeNull();
     });
 
     it('return releases for yaml API directly exposing in Renovate format', async () => {

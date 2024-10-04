@@ -3,10 +3,12 @@ import { mergeChildConfig } from '../../../../config';
 import type { ValidationMessage } from '../../../../config/types';
 import { CONFIG_VALIDATION } from '../../../../constants/error-messages';
 import { logger } from '../../../../logger';
-import {
+import type {
   GetDigestInputConfig,
   Release,
   ReleaseResult,
+} from '../../../../modules/datasource';
+import {
   applyDatasourceFilters,
   getDigest,
   getRawPkgReleases,
@@ -19,6 +21,7 @@ import {
 } from '../../../../modules/datasource/common';
 import { getRangeStrategy } from '../../../../modules/manager';
 import * as allVersioning from '../../../../modules/versioning';
+import { id as dockerVersioningId } from '../../../../modules/versioning/docker';
 import { ExternalHostError } from '../../../../types/errors/external-host-error';
 import { assignKeys } from '../../../../util/assign-keys';
 import { applyPackageRules } from '../../../../util/package-rules';
@@ -187,7 +190,7 @@ export async function lookupUpdates(
       // istanbul ignore if
       if (allVersions.length === 0) {
         const message = `Found no results from datasource that look like a version`;
-        logger.debug(
+        logger.info(
           {
             dependency: config.packageName,
             result: dependency,
@@ -199,7 +202,10 @@ export async function lookupUpdates(
         }
       }
       // Reapply package rules in case we missed something from sourceUrl
-      config = applyPackageRules({ ...config, sourceUrl: res.sourceUrl });
+      config = applyPackageRules(
+        { ...config, sourceUrl: res.sourceUrl },
+        'source-url',
+      );
       if (config.followTag) {
         const taggedVersion = dependency.tags?.[config.followTag];
         if (!taggedVersion) {
@@ -312,7 +318,10 @@ export async function lookupUpdates(
           )
         ) {
           // Reapply package rules to check matches for matchCurrentAge
-          config = applyPackageRules({ ...config, currentVersionTimestamp });
+          config = applyPackageRules(
+            { ...config, currentVersionTimestamp },
+            'current-timestamp',
+          );
         }
       }
 
@@ -361,8 +370,67 @@ export async function lookupUpdates(
           unconstrainedValue ||
           versioning.isCompatible(v.version, compareValue),
       );
-      if (config.isVulnerabilityAlert && !config.osvVulnerabilityAlerts) {
-        filteredReleases = filteredReleases.slice(0, 1);
+      let shrinkedViaVulnerability = false;
+      if (config.isVulnerabilityAlert) {
+        if (config.vulnerabilityFixVersion) {
+          res.vulnerabilityFixVersion = config.vulnerabilityFixVersion;
+          res.vulnerabilityFixStrategy = config.vulnerabilityFixStrategy;
+          if (versioning.isValid(config.vulnerabilityFixVersion)) {
+            let fixedFilteredReleases;
+            if (versioning.isVersion(config.vulnerabilityFixVersion)) {
+              // Retain only releases greater than or equal to the fix version
+              fixedFilteredReleases = filteredReleases.filter(
+                (release) =>
+                  !versioning.isGreaterThan(
+                    config.vulnerabilityFixVersion!,
+                    release.version,
+                  ),
+              );
+            } else {
+              // Retain only releases which max the fix constraint
+              fixedFilteredReleases = filteredReleases.filter((release) =>
+                versioning.matches(
+                  release.version,
+                  config.vulnerabilityFixVersion!,
+                ),
+              );
+            }
+            // Warn if this filtering results caused zero releases
+            if (fixedFilteredReleases.length === 0 && filteredReleases.length) {
+              logger.warn(
+                {
+                  releases: filteredReleases,
+                  vulnerabilityFixVersion: config.vulnerabilityFixVersion,
+                  packageName: config.packageName,
+                },
+                'No releases satisfy vulnerabilityFixVersion',
+              );
+            }
+            // Use the additionally filtered releases
+            filteredReleases = fixedFilteredReleases;
+          } else {
+            logger.warn(
+              {
+                vulnerabilityFixVersion: config.vulnerabilityFixVersion,
+                packageName: config.packageName,
+              },
+              'vulnerabilityFixVersion is not valid',
+            );
+          }
+        }
+        if (config.vulnerabilityFixStrategy === 'highest') {
+          // Don't shrink the list of releases - let Renovate use its normal logic
+          logger.once.debug(
+            `Using vulnerabilityFixStrategy=highest for ${config.packageName}`,
+          );
+        } else {
+          // Shrink the list of releases to the lowest fixed version
+          logger.once.debug(
+            `Using vulnerabilityFixStrategy=lowest for ${config.packageName}`,
+          );
+          filteredReleases = filteredReleases.slice(0, 1);
+          shrinkedViaVulnerability = true;
+        }
       }
       const buckets: Record<string, [Release]> = {};
       for (const release of filteredReleases) {
@@ -409,6 +477,17 @@ export async function lookupUpdates(
           bucket,
           release,
         );
+
+        // #29034
+        if (
+          config.manager === 'gomod' &&
+          compareValue?.startsWith('v0.0.0-') &&
+          update.newValue?.startsWith('v0.0.0-') &&
+          config.currentDigest !== update.newDigest
+        ) {
+          update.updateType = 'digest';
+        }
+
         if (pendingChecks) {
           update.pendingChecks = pendingChecks;
         }
@@ -439,7 +518,32 @@ export async function lookupUpdates(
         res.isSingleVersion ??=
           is.string(update.newValue) &&
           versioning.isSingleVersion(update.newValue);
-        res.updates.push(update);
+        // istanbul ignore if
+        if (
+          config.versioning === dockerVersioningId &&
+          update.updateType !== 'rollback' &&
+          update.newValue &&
+          versioning.isVersion(update.newValue) &&
+          compareValue &&
+          versioning.isVersion(compareValue) &&
+          versioning.isGreaterThan(compareValue, update.newValue)
+        ) {
+          logger.warn(
+            {
+              packageName: config.packageName,
+              currentValue: config.currentValue,
+              compareValue,
+              currentVersion: config.currentVersion,
+              update,
+              allVersionsLength: allVersions.length,
+              filteredReleaseVersions: filteredReleases.map((r) => r.version),
+              shrinkedViaVulnerability,
+            },
+            'Unexpected downgrade detected: skipping',
+          );
+        } else {
+          res.updates.push(update);
+        }
       }
     } else if (compareValue) {
       logger.debug(
@@ -528,6 +632,21 @@ export async function lookupUpdates(
             registryUrl: update.registryUrl ?? res.registryUrl,
             lookupName: res.lookupName,
           };
+
+          // #20304 only pass it for replacement updates, otherwise we get wrong or invalid digest
+          if (update.updateType !== 'replacement') {
+            delete getDigestConfig.replacementName;
+          }
+
+          // #20304 don't use lookupName and currentDigest when we replace image name
+          if (
+            update.updateType === 'replacement' &&
+            update.newName !== config.packageName
+          ) {
+            delete getDigestConfig.lookupName;
+            delete getDigestConfig.currentDigest;
+          }
+
           // TODO #22198
           update.newDigest ??=
             dependency?.releases.find((r) => r.version === update.newValue)
